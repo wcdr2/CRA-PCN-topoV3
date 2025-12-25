@@ -938,105 +938,148 @@ class TopoCRAPCN_V2(nn.Module):
                 "topo_feat": topo_feat,          # (B,N2,H)
             }
 
-class TopoCRAPCN_V3(nn.Module):
-    """
-    V3: 在 V2 (TopoCRAPCN_V2) 的基础上，增加 ESPAttention 精修层。
 
-      - 先用 TopoCRAPCN_V2 得到 p3_refined 和 delta_p3；
-      - 把 [p3_refined, delta_p3] 映射到特征空间，输入 ESPAttention；
-      - 基于 ESP 输出预测精修位移 delta_fine，得到最终点云 p3_final。
-    """
+
+class TopoCRAPCN_V3(nn.Module):
     def __init__(self,
                  topo_hidden_dim=128,
                  topo_k=16,
-                 topo_layers=2,      # 保留参数签名，方便兼容旧脚本，不实际使用
+                 topo_layers=2,
                  delta_scale=0.2,
                  esp_feat_dim=64,
-                 use_topo_v2=True):
+                 use_topo_v2=True,
+                 # ✅ 新增：门控 + 多噪声
+                 use_gate=True,
+                 gate_dim=1,              # 1: (B,N,1) 更稳；3: (B,N,3) 更强
+                 gate_drop=0.0,           # 可先 0，稳定后再 0.05~0.1
+                 use_denoise=True,
+                 sigma_min=0.003,
+                 sigma_max=0.015,
+                 time_dim=32,
+                 delta_fine_scale=0.05    # ✅ 精修位移别太大，先小后再放
+                 ):
         super().__init__()
+        self.use_gate = use_gate
+        self.gate_dim = gate_dim
+        self.gate_drop = gate_drop
+        self.use_denoise = use_denoise
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.delta_fine_scale = delta_fine_scale
 
-        self.use_topo_v2 = use_topo_v2
-
-        if self.use_topo_v2:
-            # ✅ 使用带 TopoReasoningBlockV2 的版本作为 backbone
+        # backbone (你原来的 V2)
+        if use_topo_v2:
             self.backbone = TopoCRAPCN_V2(
                 topo_hidden_dim=topo_hidden_dim,
                 topo_k=topo_k,
-                delta_scale=delta_scale,
+                topo_layers=topo_layers,
+                delta_scale=delta_scale
             )
         else:
-            # 若想退回旧的 GraphTopoLayer 版本，可以把 use_topo_v2=False
-            self.backbone = TopoCRAPCN(
-                topo_hidden_dim=topo_hidden_dim,
-                topo_k=topo_k,
-                topo_layers=topo_layers,
-                delta_scale=delta_scale,
-            )
+            self.backbone = TopoCRAPCN(...)
 
-        self.esp_feat_dim = esp_feat_dim
-
-        # 将 [坐标, coarse 位移] -> 特征 (B,N,6) -> (B,N,C)
+        # feat mlp: [p3, delta_p3] -> feat
         self.feat_mlp = nn.Sequential(
             nn.Linear(6, esp_feat_dim),
             nn.ReLU(inplace=True),
             nn.Linear(esp_feat_dim, esp_feat_dim),
         )
 
-        # ESP 注意力模块（Earth Mover / Sliced Wasserstein 注意力）
-    
-
+        # ESPAttention（你现有）
         self.esp = EspAttention(
-            dim=esp_feat_dim,
-            heads=4,
-            dim_head=32,
-            dropout=0.0,
-            interp=None,
-            learnable=True,
-            temperature=10,
-            qkv_bias=False,
-            max_points=1024,  # 🔹 限制参与 OT 的点数
+            dim=esp_feat_dim, heads=8, dim_head=32,
+            dropout=0.0, interp=None, learnable=True,
+            temperature=10, qkv_bias=False, max_points=1024
         )
 
+        # ✅ timestep embedding
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, time_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(time_dim, time_dim),
+        )
 
-        # 使用 ESP 输出 + 坐标预测精修位移 Δfine
+        # head input: [feat_esp, p3_in, t_emb]
+        head_in_dim = esp_feat_dim + 3 + time_dim
+
+        # ✅ gate
+        if self.use_gate:
+            self.gate_layer = nn.Sequential(
+                nn.Linear(head_in_dim, esp_feat_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(esp_feat_dim, gate_dim),
+            )
+            self.gate_dropout = nn.Dropout(p=gate_drop)
+
+        # ✅ delta head（把 t 也喂进去）
         self.delta_head = nn.Sequential(
-            nn.Linear(esp_feat_dim + 3, esp_feat_dim),
+            nn.Linear(head_in_dim, esp_feat_dim),
             nn.ReLU(inplace=True),
             nn.Linear(esp_feat_dim, 3),
         )
 
+    def _sample_sigma(self, B, device):
+        # t ~ U(0,1)
+        t = torch.rand(B, 1, device=device)
+        # 指数插值：sigma(t)=sigma_min*(sigma_max/sigma_min)^t
+        sigma = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+        return t, sigma
+
     def forward(self, xyz, return_all=False):
-        """
-        xyz: (B, N_in, 3) 残缺点云
-        """
-        # 先跑 V2 主干，拿到 p3_refined、delta_p3 等中间结果
         out = self.backbone(xyz, return_all=True)
-        p3_refined = out["p3_refined"]                      # (B,N3,3)
-        # 有的版本可能没有 delta_p3，这里做个安全回退
+        p3_refined = out["p3_refined"]
         delta_p3 = out.get("delta_p3", torch.zeros_like(p3_refined))
 
-        # 构造 ESP 的输入特征：[坐标, coarse 位移]
-        feat_in = torch.cat([p3_refined, delta_p3], dim=-1) # (B,N3,6)
-        feat = self.feat_mlp(feat_in)                       # (B,N3,C)
+        B, N, _ = p3_refined.shape
+        device = p3_refined.device
 
-        # 通过 ESPAttention 做非局部精修
-        esp_out = self.esp(feat)                            # 可能返回 (feat,) 或 (feat, attn)
-        if isinstance(esp_out, tuple):
-            feat_esp = esp_out[0]
+        # ✅ 多噪声注入（仅训练）
+        if self.training and self.use_denoise:
+            t, sigma = self._sample_sigma(B, device)
+            noise = torch.randn_like(p3_refined) * sigma[:, None, :]
+            p3_in = p3_refined + noise
         else:
-            feat_esp = esp_out                              # (B,N3,C)
+            t = torch.zeros(B, 1, device=device)
+            sigma = torch.zeros(B, 1, device=device)
+            p3_in = p3_refined
 
-        # 再拼回坐标，预测精修位移 Δfine
-        feat_cat = torch.cat([feat_esp, p3_refined], dim=-1)  # (B,N3,C+3)
-        delta_fine = self.delta_head(feat_cat)                # (B,N3,3)
-        p3_final = p3_refined + delta_fine
+        # ESP features
+        feat_in = torch.cat([p3_in, delta_p3], dim=-1)    # (B,N,6)
+        feat = self.feat_mlp(feat_in)                    # (B,N,C)
+        esp_out = self.esp(feat)
+        feat_esp = esp_out[0] if isinstance(esp_out, tuple) else esp_out
+
+        # timestep embedding broadcast
+        t_emb = self.time_mlp(t)                         # (B,time_dim)
+        t_emb = t_emb[:, None, :].expand(B, N, t_emb.shape[-1])
+
+        head_in = torch.cat([feat_esp, p3_in, t_emb], dim=-1)  # (B,N,C+3+T)
+
+        delta_raw = self.delta_head(head_in) * self.delta_fine_scale
+
+        gate = None
+        if self.use_gate:
+            gate = torch.sigmoid(self.gate_layer(head_in))     # (B,N,1) or (B,N,3)
+            if self.gate_drop > 0 and self.training:
+                gate = self.gate_dropout(gate)
+            # broadcast if gate_dim==1
+            if gate.shape[-1] == 1:
+                delta_fine = delta_raw * gate
+            else:
+                delta_fine = delta_raw * gate
+        else:
+            delta_fine = delta_raw
+
+        p3_final = p3_in + delta_fine
 
         if not return_all:
-            # 输出多尺度点云列表（最后一层换成 p3_final）
             return [out["p_sd"], out["p1"], out["p2_refined"], p3_final]
         else:
-            # 在 V2 的中间结果基础上追加 V3 的输出
             out_v3 = dict(out)
+            out_v3["p3_in"] = p3_in
             out_v3["p3_final"] = p3_final
             out_v3["delta_fine"] = delta_fine
+            out_v3["gate"] = gate
+            out_v3["t"] = t
+            out_v3["sigma"] = sigma
             return out_v3
